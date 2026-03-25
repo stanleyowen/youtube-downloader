@@ -162,8 +162,21 @@ function formatNumber(num) {
   return num.toString();
 }
 
+function sanitizeFilename(filename) {
+  // Remove invalid filesystem characters and replace with underscore
+  return filename
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 200); // Limit length to avoid filesystem issues
+}
+
 export async function downloadVideo(url, quality, downloadId) {
-  const outputPath = path.join(DOWNLOADS_DIR, `${downloadId}.%(ext)s`);
+  // Get video info to extract the title
+  const info = await getVideoInfo(url);
+  const sanitizedTitle = sanitizeFilename(info.title);
+
+  const outputPath = path.join(DOWNLOADS_DIR, `${sanitizedTitle}.%(ext)s`);
 
   const args = [url, "-o", outputPath];
 
@@ -183,7 +196,7 @@ export async function downloadVideo(url, quality, downloadId) {
 
   // Find the downloaded file
   const files = fs.readdirSync(DOWNLOADS_DIR);
-  const downloadedFile = files.find((f) => f.startsWith(downloadId));
+  const downloadedFile = files.find((f) => f.startsWith(sanitizedTitle));
 
   if (!downloadedFile) {
     throw new Error("Download failed - file not found");
