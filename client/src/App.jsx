@@ -7,22 +7,6 @@ import PlaylistView from './components/PlaylistView';
 
 const API_BASE = '/api';
 
-function buildApiUrl(path) {
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  const fullPath = `${API_BASE}${normalizedPath}`;
-
-  // Build absolute URLs so fetch/navigation work consistently across hosts/webviews.
-  if (typeof window !== 'undefined') {
-    try {
-      return new URL(fullPath, window.location.origin).toString();
-    } catch {
-      return fullPath;
-    }
-  }
-
-  return fullPath;
-}
-
 export default function App() {
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -48,7 +32,7 @@ export default function App() {
     setVideoInfo(null);
 
     try {
-      const response = await fetch(buildApiUrl('/info'), {
+      const response = await fetch(`${API_BASE}/info`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url })
@@ -81,12 +65,8 @@ export default function App() {
     setError(null);
 
     try {
-      if (!url || typeof url !== 'string') {
-        throw new Error('Invalid video URL from source metadata');
-      }
-
       // Start the download
-      const response = await fetch(buildApiUrl('/download'), {
+      const response = await fetch(`${API_BASE}/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, quality })
@@ -105,17 +85,17 @@ export default function App() {
 
       // Poll for completion
       let attempts = 0;
-      const maxAttempts = 900; // 15 minutes timeout
+      const maxAttempts = 120; // 2 minutes timeout
 
       while (attempts < maxAttempts) {
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        const statusResponse = await fetch(buildApiUrl(`/status/${downloadId}`));
+        const statusResponse = await fetch(`${API_BASE}/status/${downloadId}`);
         const statusData = await statusResponse.json();
 
         if (statusData.status === 'ready') {
           // Trigger download
-          window.location.assign(buildApiUrl(`/file/${downloadId}`));
+          window.location.href = `${API_BASE}/file/${downloadId}`;
 
           if (videoId) {
             setDownloadingIds(prev => {
@@ -143,12 +123,7 @@ export default function App() {
 
       throw new Error('Download timed out');
     } catch (err) {
-      const message = err?.message || 'Download failed';
-      setError(
-        message === 'The string did not match the expected pattern.'
-          ? 'Invalid URL pattern detected. Please refresh the page and try again.'
-          : message,
-      );
+      setError(err.message);
       if (videoId) {
         setDownloadingIds(prev => {
           const newSet = new Set(prev);
@@ -183,11 +158,11 @@ export default function App() {
               <Youtube className="h-8 w-8 text-white" />
             </div>
             <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
-              Video Downloader
+              YouTube Downloader
             </h1>
           </div>
           <p className="text-gray-500 dark:text-gray-400 mb-8 text-center">
-            Download videos and playlists from supported sites in any quality
+            Download videos and playlists in any quality
           </p>
 
           <UrlInput onSubmit={fetchInfo} loading={loading} />
@@ -215,7 +190,7 @@ export default function App() {
                 />
 
                 <button
-                  onClick={() => startDownload(videoInfo.url, selectedQuality)}
+                  onClick={() => startDownload(`https://www.youtube.com/watch?v=${videoInfo.id}`, selectedQuality)}
                   disabled={downloading}
                   className="w-full py-4 bg-red-500 hover:bg-red-600 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white font-semibold rounded-xl transition-all disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >

@@ -14,33 +14,11 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 }
 
 async function runYtDlp(args) {
-  const buildCommand = (extraArgs = []) =>
-    `yt-dlp ${[...extraArgs, ...args].map((a) => `"${a}"`).join(" ")}`;
-
-  try {
-    const { stdout } = await execAsync(buildCommand(), {
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    return stdout;
-  } catch (error) {
-    const errorText = `${error?.message || ""}\n${error?.stderr || ""}`;
-    const hasSslError =
-      /CERTIFICATE_VERIFY_FAILED|SSL: CERTIFICATE_VERIFY_FAILED/i.test(
-        errorText,
-      );
-
-    if (hasSslError) {
-      const { stdout } = await execAsync(
-        buildCommand(["--no-check-certificates"]),
-        {
-          maxBuffer: 10 * 1024 * 1024,
-        },
-      );
-      return stdout;
-    }
-
-    throw error;
-  }
+  const command = `yt-dlp ${args.map((a) => `"${a}"`).join(" ")}`;
+  const { stdout, stderr } = await execAsync(command, {
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return stdout;
 }
 
 export async function getVideoInfo(url) {
@@ -86,8 +64,10 @@ export async function getPlaylistInfo(url) {
       videos: videos.map((v) => ({
         id: v.id,
         title: v.title,
-        url: resolveEntryUrl(v),
-        thumbnail: v.thumbnail || v.thumbnails?.[0]?.url || null,
+        url: `https://www.youtube.com/watch?v=${v.id}`,
+        thumbnail:
+          v.thumbnails?.[0]?.url ||
+          `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
         duration: v.duration ? formatDuration(v.duration) : "N/A",
       })),
     };
@@ -151,7 +131,6 @@ function parseVideoInfo(info) {
   return {
     isPlaylist: false,
     id: info.id,
-    url: info.webpage_url || info.original_url || info.url,
     title: info.title,
     thumbnail: info.thumbnail,
     duration: formatDuration(info.duration),
@@ -159,21 +138,6 @@ function parseVideoInfo(info) {
     viewCount: info.view_count ? formatNumber(info.view_count) : null,
     qualities,
   };
-}
-
-function resolveEntryUrl(entry) {
-  const directUrl = entry.webpage_url || entry.original_url || entry.url;
-
-  if (typeof directUrl === "string" && /^https?:\/\//i.test(directUrl)) {
-    return directUrl;
-  }
-
-  if (entry.extractor_key && typeof directUrl === "string" && directUrl) {
-    // yt-dlp accepts extractor-prefixed URLs (for example, youtube:VIDEO_ID).
-    return `${entry.extractor_key.toLowerCase()}:${directUrl}`;
-  }
-
-  return directUrl || "";
 }
 
 function formatDuration(seconds) {

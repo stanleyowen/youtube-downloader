@@ -31,7 +31,7 @@ export default function UrlInput({ onSubmit, loading }) {
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="Paste video URL here..."
+            placeholder="Paste YouTube URL here..."
             className="w-full pl-12 pr-12 py-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent transition-all"
             disabled={loading}
           />
