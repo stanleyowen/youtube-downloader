@@ -41,6 +41,20 @@ npm start
 
 Server runs on http://localhost:3001
 
+### Backend scalability tuning
+
+You can tune concurrent downloads and queue limits with environment variables:
+
+```bash
+MAX_CONCURRENT_DOWNLOADS=4
+MAX_DOWNLOAD_QUEUE_SIZE=500
+DOWNLOAD_RETRY_LIMIT=1
+```
+
+- `MAX_CONCURRENT_DOWNLOADS`: how many yt-dlp jobs run at once
+- `MAX_DOWNLOAD_QUEUE_SIZE`: max queued requests before returning "server busy"
+- `DOWNLOAD_RETRY_LIMIT`: retry count for transient network/download failures
+
 ### Frontend
 
 ```bash

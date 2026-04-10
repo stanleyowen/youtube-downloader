@@ -6,7 +6,6 @@ import {
   getVideoInfo,
   getPlaylistInfo,
   downloadVideo,
-  getDownloadPath,
   cleanupDownload,
   isPlaylistUrl,
 } from "../utils/ytdlp.js";
@@ -15,18 +14,139 @@ const router = express.Router();
 
 // Store active downloads
 const activeDownloads = new Map();
+const pendingDownloads = [];
+const MAX_CONCURRENT_DOWNLOADS =
+  Number.parseInt(process.env.MAX_CONCURRENT_DOWNLOADS || "4", 10) || 4;
+const MAX_QUEUE_SIZE =
+  Number.parseInt(process.env.MAX_DOWNLOAD_QUEUE_SIZE || "500", 10) || 500;
+const DOWNLOAD_RETRY_LIMIT =
+  Number.parseInt(process.env.DOWNLOAD_RETRY_LIMIT || "1", 10) || 1;
+const DOWNLOAD_TTL_MS = 30 * 60 * 1000;
+const STALE_DOWNLOAD_MS = 2 * 60 * 60 * 1000;
+let runningDownloads = 0;
+
+function updateDownload(id, updates) {
+  const existing = activeDownloads.get(id);
+  if (!existing) {
+    return;
+  }
+
+  activeDownloads.set(id, {
+    ...existing,
+    ...updates,
+    timestamp: Date.now(),
+  });
+}
+
+function getQueuePosition(downloadId) {
+  const index = pendingDownloads.findIndex((task) => task.downloadId === downloadId);
+  return index >= 0 ? index + 1 : null;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableError(error) {
+  const message = `${error?.message || ""}\n${error?.stderr || ""}`;
+  return /ETIMEDOUT|ECONNRESET|ENOTFOUND|429|500|502|503|network|temporarily unavailable|timeout/i.test(
+    message,
+  );
+}
+
+async function runDownloadTask(task) {
+  const { downloadId, url, quality } = task;
+  updateDownload(downloadId, { status: "downloading", startedAt: Date.now() });
+
+  for (let attempt = 0; attempt <= DOWNLOAD_RETRY_LIMIT; attempt += 1) {
+    try {
+      const filePath = await downloadVideo(url, quality, downloadId);
+      updateDownload(downloadId, {
+        status: "ready",
+        completedAt: Date.now(),
+        path: filePath,
+        error: null,
+      });
+      return;
+    } catch (error) {
+      const isLastAttempt = attempt >= DOWNLOAD_RETRY_LIMIT;
+
+      if (!isLastAttempt && isRetryableError(error)) {
+        updateDownload(downloadId, {
+          status: "retrying",
+          error: `Retrying download (${attempt + 1}/${DOWNLOAD_RETRY_LIMIT})`,
+        });
+        await wait(1500 * (attempt + 1));
+        continue;
+      }
+
+      updateDownload(downloadId, {
+        status: "error",
+        error: error.message,
+        path: null,
+      });
+      return;
+    }
+  }
+}
+
+function processQueue() {
+  while (
+    runningDownloads < MAX_CONCURRENT_DOWNLOADS &&
+    pendingDownloads.length > 0
+  ) {
+    const nextTask = pendingDownloads.shift();
+    const tracked = nextTask ? activeDownloads.get(nextTask.downloadId) : null;
+
+    if (!nextTask || !tracked || tracked.status !== "queued") {
+      continue;
+    }
+
+    runningDownloads += 1;
+    runDownloadTask(nextTask)
+      .catch((error) => {
+        updateDownload(nextTask.downloadId, {
+          status: "error",
+          error: error.message,
+          path: null,
+        });
+      })
+      .finally(() => {
+        runningDownloads = Math.max(0, runningDownloads - 1);
+        processQueue();
+      });
+  }
+}
 
 // Clean up old downloads periodically (every 10 minutes)
 setInterval(
   () => {
     const now = Date.now();
     for (const [id, data] of activeDownloads.entries()) {
-      // Remove downloads older than 30 minutes
-      if (now - data.timestamp > 30 * 60 * 1000) {
+      // Remove completed/error downloads older than 30 minutes.
+      if (
+        ["ready", "error"].includes(data.status) &&
+        now - data.timestamp > DOWNLOAD_TTL_MS
+      ) {
         if (data.path) {
           cleanupDownload(data.path);
         }
         activeDownloads.delete(id);
+        continue;
+      }
+
+      // Mark stale active downloads as failed so clients stop polling forever.
+      if (
+        ["queued", "downloading", "retrying"].includes(data.status) &&
+        now - data.timestamp > STALE_DOWNLOAD_MS
+      ) {
+        activeDownloads.set(id, {
+          ...data,
+          status: "error",
+          error: "Download timed out while processing",
+          path: null,
+          timestamp: now,
+        });
       }
     }
   },
@@ -65,37 +185,39 @@ router.post("/download", async (req, res) => {
       return res.status(400).json({ error: "URL is required" });
     }
 
-    const downloadId = uuidv4();
-    const qualityHeight =
-      quality === "audio" ? "audio" : quality.replace("p", "");
+    if (pendingDownloads.length >= MAX_QUEUE_SIZE) {
+      return res.status(503).json({
+        error: "Server is busy. Please try again shortly.",
+      });
+    }
 
-    // Store download status
+    const downloadId = uuidv4();
+    const requestedQuality =
+      quality === "audio" || /^\d+p$/.test(quality || "") ? quality : "720p";
+    const qualityHeight =
+      requestedQuality === "audio" ? "audio" : requestedQuality.replace("p", "");
+
+    // Store download status and enqueue work.
     activeDownloads.set(downloadId, {
-      status: "downloading",
+      status: "queued",
       timestamp: Date.now(),
       path: null,
+      error: null,
     });
 
-    // Start download in background
-    downloadVideo(url, qualityHeight, downloadId)
-      .then((filePath) => {
-        activeDownloads.set(downloadId, {
-          status: "ready",
-          timestamp: Date.now(),
-          path: filePath,
-        });
-      })
-      .catch((error) => {
-        console.error("Download error:", error);
-        activeDownloads.set(downloadId, {
-          status: "error",
-          timestamp: Date.now(),
-          error: error.message,
-          path: null,
-        });
-      });
+    pendingDownloads.push({
+      downloadId,
+      url,
+      quality: qualityHeight,
+      createdAt: Date.now(),
+    });
+    processQueue();
 
-    res.json({ downloadId, status: "started" });
+    res.json({
+      downloadId,
+      status: "queued",
+      queuePosition: getQueuePosition(downloadId),
+    });
   } catch (error) {
     console.error("Download init error:", error);
     res.status(500).json({ error: error.message });
@@ -111,7 +233,11 @@ router.get("/status/:id", (req, res) => {
     return res.status(404).json({ error: "Download not found" });
   }
 
-  res.json({ status: download.status, error: download.error });
+  res.json({
+    status: download.status,
+    error: download.error,
+    queuePosition: download.status === "queued" ? getQueuePosition(id) : null,
+  });
 });
 
 // Serve downloaded file
