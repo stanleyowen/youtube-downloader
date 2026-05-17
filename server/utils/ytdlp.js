@@ -1,6 +1,16 @@
 import { spawn } from "child_process";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DOWNLOADS_DIR = path.join(__dirname, "..", "downloads");
 const MAX_STDERR_BUFFER = 256 * 1024;
+
+// Ensure downloads directory exists
+if (!fs.existsSync(DOWNLOADS_DIR)) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+}
 
 function appendLimited(target, chunk, maxLength) {
   const nextValue = target + chunk;
@@ -122,6 +132,7 @@ export async function getPlaylistInfo(url) {
 function parseVideoInfo(info) {
   const formats = info.formats || [];
 
+  // Get available video qualities
   const videoFormats = formats
     .filter((f) => f.vcodec !== "none" && f.acodec !== "none" && f.height)
     .reduce((acc, f) => {
@@ -135,6 +146,7 @@ function parseVideoInfo(info) {
       return acc;
     }, {});
 
+  // Get video-only formats for higher qualities
   const videoOnlyFormats = formats
     .filter((f) => f.vcodec !== "none" && f.acodec === "none" && f.height)
     .reduce((acc, f) => {
@@ -148,6 +160,7 @@ function parseVideoInfo(info) {
       return acc;
     }, {});
 
+  // Combine and create quality options
   const allHeights = new Set([
     ...Object.keys(videoFormats).map(Number),
     ...Object.keys(videoOnlyFormats).map(Number),
@@ -161,6 +174,7 @@ function parseVideoInfo(info) {
       label: `${height}p${height >= 1080 ? " HD" : ""}`,
     }));
 
+  // Add audio-only option
   qualities.push({
     quality: "audio",
     height: 0,
@@ -188,6 +202,7 @@ function resolveEntryUrl(entry) {
   }
 
   if (entry.extractor_key && typeof directUrl === "string" && directUrl) {
+    // yt-dlp accepts extractor-prefixed URLs (for example, youtube:VIDEO_ID).
     return `${entry.extractor_key.toLowerCase()}:${directUrl}`;
   }
 
@@ -217,90 +232,69 @@ function formatNumber(num) {
 }
 
 function sanitizeFilename(filename) {
+  // Remove invalid filesystem characters and replace with underscore
   return filename
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
     .replace(/\s+/g, " ")
     .trim()
-    .substring(0, 200);
+    .substring(0, 200); // Limit length to avoid filesystem issues
 }
 
-function buildStreamArgs(url, quality) {
-  const args = [url, "--no-playlist", "-o", "-", "--no-part", "--quiet", "--no-warnings"];
+export async function downloadVideo(url, quality, downloadId) {
+  // Get video info to extract the title
+  const info = await getVideoInfo(url);
+  const sanitizedTitle = sanitizeFilename(info.title || "video");
+  const filePrefix = `${downloadId}-${sanitizedTitle}`;
+  const outputPath = path.join(DOWNLOADS_DIR, `${filePrefix}.%(ext)s`);
+
+  const args = [url, "--no-playlist", "-o", outputPath];
 
   if (quality === "audio") {
     args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
   } else {
+    // Prefer MP4 video + M4A audio, then fall back to any format that still has audio.
     args.push(
       "-f",
       `bestvideo[ext=mp4][height<=${quality}]+bestaudio[ext=m4a]/best[ext=mp4][height<=${quality}][acodec!=none]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}][acodec!=none]/best[acodec!=none]`,
-      "--merge-output-format", "mp4",
-      // Make mp4 streamable to stdout (fragmented moov so ffmpeg doesn't need to seek).
-      "--postprocessor-args", "Merger:-movflags +frag_keyframe+empty_moov+default_base_moof",
+      "--merge-output-format",
+      "mp4",
     );
   }
 
-  return args;
+  await runYtDlp(args, { captureStdout: false });
+
+  // Find the downloaded file
+  const files = fs.readdirSync(DOWNLOADS_DIR);
+  const downloadedFiles = files
+    .filter((f) => f.startsWith(filePrefix))
+    .sort((a, b) => {
+      const aTime = fs.statSync(path.join(DOWNLOADS_DIR, a)).mtimeMs;
+      const bTime = fs.statSync(path.join(DOWNLOADS_DIR, b)).mtimeMs;
+      return bTime - aTime;
+    });
+  const downloadedFile = downloadedFiles[0];
+
+  if (!downloadedFile) {
+    throw new Error("Download failed - file not found");
+  }
+
+  return path.join(DOWNLOADS_DIR, downloadedFile);
 }
 
-export async function streamDownload(url, quality, response) {
-  const info = await getVideoInfo(url);
-  const sanitizedTitle = sanitizeFilename(info.title || "video");
-  const extension = quality === "audio" ? "mp3" : "mp4";
-  const filename = `${sanitizedTitle}.${extension}`;
-  const asciiFallback = filename.replace(/[^\x20-\x7E]/g, "_");
+export function getDownloadPath(downloadId) {
+  const files = fs.readdirSync(DOWNLOADS_DIR);
+  const file = files.find((f) => f.startsWith(`${downloadId}-`));
+  return file ? path.join(DOWNLOADS_DIR, file) : null;
+}
 
-  response.setHeader(
-    "Content-Type",
-    quality === "audio" ? "audio/mpeg" : "video/mp4",
-  );
-  response.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
-  );
-
-  const args = buildStreamArgs(url, quality);
-
-  await new Promise((resolve, reject) => {
-    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-    let settled = false;
-
-    const settle = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      fn(value);
-    };
-
-    proc.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk.toString(), MAX_STDERR_BUFFER);
-    });
-
-    proc.stdout.on("error", () => {
-      // Client disconnect causes EPIPE here; handled via response.close below.
-    });
-
-    proc.stdout.pipe(response);
-
-    proc.on("error", (err) => settle(reject, err));
-
-    proc.on("close", (code, signal) => {
-      if (code === 0) {
-        settle(resolve);
-        return;
-      }
-      const err = new Error(
-        `yt-dlp failed with exit code ${code}${signal ? ` (signal: ${signal})` : ""}`,
-      );
-      err.stderr = stderr;
-      settle(reject, err);
-    });
-
-    response.on("close", () => {
-      if (proc.exitCode === null && proc.signalCode === null) {
-        proc.kill("SIGTERM");
-      }
-    });
-  });
+export function cleanupDownload(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    console.error("Cleanup error:", error);
+  }
 }
 
 export function isPlaylistUrl(url) {

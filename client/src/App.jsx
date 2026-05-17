@@ -80,7 +80,75 @@ export default function App() {
     }
     setError(null);
 
-    const clearDownloadState = () => {
+    try {
+      if (!url || typeof url !== 'string') {
+        throw new Error('Invalid video URL from source metadata');
+      }
+
+      // Start the download
+      const response = await fetch(buildApiUrl('/download'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, quality })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to start download');
+      }
+
+      const downloadId = data.downloadId;
+      if (!videoId) {
+        setDownloadProgress('Processing video...');
+      }
+
+      // Poll for completion
+      let attempts = 0;
+      const maxAttempts = 900; // 15 minutes timeout
+
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const statusResponse = await fetch(buildApiUrl(`/status/${downloadId}`));
+        const statusData = await statusResponse.json();
+
+        if (statusData.status === 'ready') {
+          // Trigger download
+          window.location.assign(buildApiUrl(`/file/${downloadId}`));
+
+          if (videoId) {
+            setDownloadingIds(prev => {
+              const newSet = new Set(prev);
+              newSet.delete(videoId);
+              return newSet;
+            });
+          } else {
+            setDownloadProgress('Download started!');
+            setTimeout(() => {
+              setDownloading(false);
+              setDownloadProgress('');
+            }, 2000);
+          }
+          return;
+        } else if (statusData.status === 'error') {
+          throw new Error(statusData.error || 'Download failed');
+        }
+
+        attempts++;
+        if (!videoId) {
+          setDownloadProgress(`Processing... (${attempts}s)`);
+        }
+      }
+
+      throw new Error('Download timed out');
+    } catch (err) {
+      const message = err?.message || 'Download failed';
+      setError(
+        message === 'The string did not match the expected pattern.'
+          ? 'Invalid URL pattern detected. Please refresh the page and try again.'
+          : message,
+      );
       if (videoId) {
         setDownloadingIds(prev => {
           const newSet = new Set(prev);
@@ -91,32 +159,6 @@ export default function App() {
         setDownloading(false);
         setDownloadProgress('');
       }
-    };
-
-    try {
-      if (!url || typeof url !== 'string') {
-        throw new Error('Invalid video URL from source metadata');
-      }
-
-      const params = new URLSearchParams({ url, quality: quality || '' });
-      const downloadUrl = buildApiUrl(`/download?${params.toString()}`);
-
-      // Native browser download: the Content-Disposition header on the response
-      // tells the browser to save rather than navigate, so the current page stays put.
-      window.location.assign(downloadUrl);
-
-      if (!videoId) {
-        setDownloadProgress('Download started!');
-      }
-      setTimeout(clearDownloadState, 2000);
-    } catch (err) {
-      const message = err?.message || 'Download failed';
-      setError(
-        message === 'The string did not match the expected pattern.'
-          ? 'Invalid URL pattern detected. Please refresh the page and try again.'
-          : message,
-      );
-      clearDownloadState();
     }
   };
 
