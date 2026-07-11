@@ -47,6 +47,36 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Reject anything that isn't a plain http(s) URL (or an extractor-prefixed id
+// like "youtube:VIDEO_ID" from playlist entries). Values starting with "-"
+// would otherwise be parsed by yt-dlp as options — including --exec, which
+// runs arbitrary shell commands.
+const PRIVATE_HOST_PATTERN =
+  /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$)/i;
+
+function validateTargetUrl(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 2048) {
+    return null;
+  }
+
+  if (!/^https?:/i.test(raw)) {
+    return /^[a-z][a-z0-9_]*:[\w-]+$/i.test(raw) ? raw : null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  if (PRIVATE_HOST_PATTERN.test(parsed.hostname)) {
+    return null;
+  }
+
+  return parsed.href;
+}
+
 function isRetryableError(error) {
   const message = `${error?.message || ""}\n${error?.stderr || ""}`;
   return /ETIMEDOUT|ECONNRESET|ENOTFOUND|429|500|502|503|network|temporarily unavailable|timeout/i.test(
@@ -156,10 +186,10 @@ setInterval(
 // Get video/playlist info
 router.post("/info", async (req, res) => {
   try {
-    const { url } = req.body;
+    const url = validateTargetUrl(req.body?.url);
 
     if (!url) {
-      return res.status(400).json({ error: "URL is required" });
+      return res.status(400).json({ error: "A valid http(s) URL is required" });
     }
 
     // Check if it's a playlist
@@ -179,10 +209,11 @@ router.post("/info", async (req, res) => {
 // Start download and return download ID
 router.post("/download", async (req, res) => {
   try {
-    const { url, quality } = req.body;
+    const { quality } = req.body;
+    const url = validateTargetUrl(req.body?.url);
 
     if (!url) {
-      return res.status(400).json({ error: "URL is required" });
+      return res.status(400).json({ error: "A valid http(s) URL is required" });
     }
 
     if (pendingDownloads.length >= MAX_QUEUE_SIZE) {

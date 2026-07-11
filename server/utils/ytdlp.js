@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -6,6 +6,29 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "..", "downloads");
 const MAX_STDERR_BUFFER = 256 * 1024;
+
+// Resolve full yt-dlp path at startup so PM2's minimal PATH doesn't cause ENOENT.
+function resolveYtDlpPath() {
+  const candidates = [
+    process.env.YTDLP_PATH,
+    "/usr/local/bin/yt-dlp",
+    `${process.env.HOME}/.local/bin/yt-dlp`,
+    "/usr/bin/yt-dlp",
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+
+  try {
+    return execFileSync("which", ["yt-dlp"]).toString().trim();
+  } catch {
+    return "yt-dlp";
+  }
+}
+
+const YTDLP_BIN = resolveYtDlpPath();
+console.log(`[yt-dlp] using binary: ${YTDLP_BIN}`);
 
 // Ensure downloads directory exists
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -27,35 +50,41 @@ async function runYtDlp(args, options = {}) {
     throw new Error("yt-dlp arguments are required");
   }
 
+  const BASE_ARGS = [
+    "--user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  ];
+
   const runOnce = (extraArgs = []) =>
     new Promise((resolve, reject) => {
-      const process = spawn("yt-dlp", [...extraArgs, ...args], {
+      const child = spawn(YTDLP_BIN, [...BASE_ARGS, ...extraArgs, ...args], {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
       let stdout = "";
       let stderr = "";
 
-      process.stdout.on("data", (chunk) => {
+      child.stdout.on("data", (chunk) => {
         if (captureStdout) {
           stdout += chunk.toString();
         }
       });
 
-      process.stderr.on("data", (chunk) => {
+      child.stderr.on("data", (chunk) => {
         stderr = appendLimited(stderr, chunk.toString(), MAX_STDERR_BUFFER);
       });
 
-      process.on("error", (error) => {
+      child.on("error", (error) => {
         reject(error);
       });
 
-      process.on("close", (code, signal) => {
+      child.on("close", (code, signal) => {
         if (code === 0) {
           resolve(stdout);
           return;
         }
 
+        console.error(`[yt-dlp] exit ${code}${signal ? ` signal:${signal}` : ""}\n${stderr}`);
         const err = new Error(
           `yt-dlp failed with exit code ${code}${signal ? ` (signal: ${signal})` : ""}`,
         );
@@ -78,21 +107,27 @@ async function runYtDlp(args, options = {}) {
 
 export async function getVideoInfo(url) {
   try {
-    const output = await runYtDlp([url, "--dump-json", "--no-playlist"]);
-    const info = JSON.parse(output);
+    const output = await runYtDlp(["--dump-json", "--no-playlist", "--", url]);
+    const jsonLine = output.split("\n").find((l) => l.trim().startsWith("{"));
+    if (!jsonLine) throw new Error("No JSON in yt-dlp output");
+    const info = JSON.parse(jsonLine);
     return parseVideoInfo(info);
   } catch (error) {
-    throw new Error(`Failed to get video info: ${error.message}`);
+    const detail = error.stderr ? `\n${error.stderr.trim()}` : "";
+    const err = new Error(`Failed to get video info: ${error.message}${detail}`);
+    err.stderr = error.stderr;
+    throw err;
   }
 }
 
 export async function getPlaylistInfo(url) {
   try {
     const output = await runYtDlp([
-      url,
       "--flat-playlist",
       "--dump-json",
       "-i",
+      "--",
+      url,
     ]);
 
     const videos = output
@@ -125,7 +160,10 @@ export async function getPlaylistInfo(url) {
       })),
     };
   } catch (error) {
-    throw new Error(`Failed to get playlist info: ${error.message}`);
+    const detail = error.stderr ? `\n${error.stderr.trim()}` : "";
+    const err = new Error(`Failed to get playlist info: ${error.message}${detail}`);
+    err.stderr = error.stderr;
+    throw err;
   }
 }
 
@@ -247,19 +285,20 @@ export async function downloadVideo(url, quality, downloadId) {
   const filePrefix = `${downloadId}-${sanitizedTitle}`;
   const outputPath = path.join(DOWNLOADS_DIR, `${filePrefix}.%(ext)s`);
 
-  const args = [url, "--no-playlist", "-o", outputPath];
+  const args = ["--no-playlist", "-o", outputPath];
 
   if (quality === "audio") {
     args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
   } else {
-    // Prefer MP4 video + M4A audio, then fall back to any format that still has audio.
     args.push(
       "-f",
-      `bestvideo[ext=mp4][height<=${quality}]+bestaudio[ext=m4a]/best[ext=mp4][height<=${quality}][acodec!=none]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}][acodec!=none]/best[acodec!=none]`,
+      `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/bestvideo+bestaudio/best`,
       "--merge-output-format",
       "mp4",
     );
   }
+
+  args.push("--", url);
 
   await runYtDlp(args, { captureStdout: false });
 
