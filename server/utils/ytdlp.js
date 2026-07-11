@@ -44,16 +44,10 @@ function appendLimited(target, chunk, maxLength) {
 }
 
 async function runYtDlp(args, options = {}) {
-  const { captureStdout = true, signal } = options;
+  const { captureStdout = true } = options;
 
   if (!Array.isArray(args) || args.length === 0) {
     throw new Error("yt-dlp arguments are required");
-  }
-
-  if (signal?.aborted) {
-    const err = new Error("yt-dlp aborted");
-    err.aborted = true;
-    throw err;
   }
 
   const BASE_ARGS = [
@@ -65,10 +59,6 @@ async function runYtDlp(args, options = {}) {
     new Promise((resolve, reject) => {
       const child = spawn(YTDLP_BIN, [...BASE_ARGS, ...extraArgs, ...args], {
         stdio: ["ignore", "pipe", "pipe"],
-        signal,
-        // Give yt-dlp a moment to clean up partial files on SIGTERM before
-        // Node escalates to SIGKILL.
-        killSignal: "SIGTERM",
       });
 
       let stdout = "";
@@ -85,28 +75,18 @@ async function runYtDlp(args, options = {}) {
       });
 
       child.on("error", (error) => {
-        if (error.name === "AbortError" || signal?.aborted) {
-          error.aborted = true;
-        }
         reject(error);
       });
 
-      child.on("close", (code, closeSignal) => {
-        if (signal?.aborted) {
-          const err = new Error("yt-dlp aborted");
-          err.aborted = true;
-          reject(err);
-          return;
-        }
-
+      child.on("close", (code, signal) => {
         if (code === 0) {
           resolve(stdout);
           return;
         }
 
-        console.error(`[yt-dlp] exit ${code}${closeSignal ? ` signal:${closeSignal}` : ""}\n${stderr}`);
+        console.error(`[yt-dlp] exit ${code}${signal ? ` signal:${signal}` : ""}\n${stderr}`);
         const err = new Error(
-          `yt-dlp failed with exit code ${code}${closeSignal ? ` (signal: ${closeSignal})` : ""}`,
+          `yt-dlp failed with exit code ${code}${signal ? ` (signal: ${signal})` : ""}`,
         );
         err.stderr = stderr;
         reject(err);
@@ -116,10 +96,6 @@ async function runYtDlp(args, options = {}) {
   try {
     return await runOnce();
   } catch (error) {
-    if (error?.aborted || signal?.aborted) {
-      throw error;
-    }
-
     const errorText = `${error?.message || ""}\n${error?.stderr || ""}`;
     if (/CERTIFICATE_VERIFY_FAILED|SSL: CERTIFICATE_VERIFY_FAILED/i.test(errorText)) {
       return runOnce(["--no-check-certificates"]);
@@ -129,11 +105,9 @@ async function runYtDlp(args, options = {}) {
   }
 }
 
-export async function getVideoInfo(url, signal) {
+export async function getVideoInfo(url) {
   try {
-    const output = await runYtDlp(["--dump-json", "--no-playlist", "--", url], {
-      signal,
-    });
+    const output = await runYtDlp(["--dump-json", "--no-playlist", "--", url]);
     const jsonLine = output.split("\n").find((l) => l.trim().startsWith("{"));
     if (!jsonLine) throw new Error("No JSON in yt-dlp output");
     const info = JSON.parse(jsonLine);
@@ -304,9 +278,9 @@ function sanitizeFilename(filename) {
     .substring(0, 200); // Limit length to avoid filesystem issues
 }
 
-export async function downloadVideo(url, quality, downloadId, signal) {
+export async function downloadVideo(url, quality, downloadId) {
   // Get video info to extract the title
-  const info = await getVideoInfo(url, signal);
+  const info = await getVideoInfo(url);
   const sanitizedTitle = sanitizeFilename(info.title || "video");
   const filePrefix = `${downloadId}-${sanitizedTitle}`;
   const outputPath = path.join(DOWNLOADS_DIR, `${filePrefix}.%(ext)s`);
@@ -326,7 +300,7 @@ export async function downloadVideo(url, quality, downloadId, signal) {
 
   args.push("--", url);
 
-  await runYtDlp(args, { captureStdout: false, signal });
+  await runYtDlp(args, { captureStdout: false });
 
   // Find the downloaded file
   const files = fs.readdirSync(DOWNLOADS_DIR);
@@ -356,25 +330,6 @@ export function cleanupDownload(filePath) {
   try {
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
-    }
-  } catch (error) {
-    console.error("Cleanup error:", error);
-  }
-}
-
-// Delete every file for a download id: the finished file plus any leftover
-// yt-dlp partials (.part, .ytdl, fragment files) from an interrupted run.
-export function deleteDownloadFiles(downloadId) {
-  try {
-    const prefix = `${downloadId}-`;
-    for (const file of fs.readdirSync(DOWNLOADS_DIR)) {
-      if (file.startsWith(prefix)) {
-        try {
-          fs.unlinkSync(path.join(DOWNLOADS_DIR, file));
-        } catch (error) {
-          console.error("Cleanup error:", error);
-        }
-      }
     }
   } catch (error) {
     console.error("Cleanup error:", error);

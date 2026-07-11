@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { Moon, Sun, Download, Loader2, AlertCircle, Youtube } from 'lucide-react';
 import UrlInput from './components/UrlInput';
 import VideoCard from './components/VideoCard';
@@ -38,26 +38,9 @@ export default function App() {
   const [downloadProgress, setDownloadProgress] = useState('');
   const [downloadingIds, setDownloadingIds] = useState(new Set());
 
-  // Track downloads still in progress so we can tell the server to cancel them
-  // if the user closes or refreshes the page.
-  const activeDownloadIds = useRef(new Set());
-
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
-
-  useEffect(() => {
-    const cancelActiveDownloads = () => {
-      for (const id of activeDownloadIds.current) {
-        // sendBeacon survives page unload where fetch would be cancelled.
-        navigator.sendBeacon?.(buildApiUrl(`/cancel/${id}`));
-      }
-      activeDownloadIds.current.clear();
-    };
-
-    window.addEventListener('pagehide', cancelActiveDownloads);
-    return () => window.removeEventListener('pagehide', cancelActiveDownloads);
-  }, []);
 
   const fetchInfo = async (url) => {
     setLoading(true);
@@ -97,8 +80,6 @@ export default function App() {
     }
     setError(null);
 
-    let downloadId = null;
-
     try {
       if (!url || typeof url !== 'string') {
         throw new Error('Invalid video URL from source metadata');
@@ -117,8 +98,7 @@ export default function App() {
         throw new Error(data.error || 'Failed to start download');
       }
 
-      downloadId = data.downloadId;
-      activeDownloadIds.current.add(downloadId);
+      const downloadId = data.downloadId;
       if (!videoId) {
         setDownloadProgress('Processing video...');
       }
@@ -134,9 +114,6 @@ export default function App() {
         const statusData = await statusResponse.json();
 
         if (statusData.status === 'ready') {
-          // The file is complete; stop tracking it so an unload beacon can't
-          // cancel it while the browser is fetching it.
-          activeDownloadIds.current.delete(downloadId);
           // Trigger download
           window.location.assign(buildApiUrl(`/file/${downloadId}`));
 
@@ -166,9 +143,6 @@ export default function App() {
 
       throw new Error('Download timed out');
     } catch (err) {
-      if (downloadId) {
-        activeDownloadIds.current.delete(downloadId);
-      }
       const message = err?.message || 'Download failed';
       setError(
         message === 'The string did not match the expected pattern.'
